@@ -210,6 +210,47 @@ async fn mtcp_listener(addr: String, port: u16) -> Result<(), io::Error> {
     }
 }
 
+/// Whether the other end of a stream closed it (it sent its end of stream).
+/// MTCP is one way: nothing else is ever read on a sending stream.
+fn peer_closed(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let mut byte = [0u8; 1];
+    let closed = match stream.peek(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+    };
+    closed || stream.set_nonblocking(false).is_err()
+}
+
+/// The connection to `addr`: the pooled one while its peer keeps it open,
+/// else a new one. A pooled stream whose peer went away (restarted, say)
+/// still takes the first write, and the bundles in it would be lost.
+fn pooled_stream(addr: SocketAddr) -> Option<TcpStream> {
+    let mut pool = MTCP_CONNECTIONS.lock();
+    if pool.get(&addr).is_some_and(peer_closed) {
+        debug!("Connection to {} closed by its peer: connecting again", addr);
+        pool.remove(&addr);
+    }
+    let stream = match pool.entry(addr) {
+        std::collections::hash_map::Entry::Occupied(e) => {
+            debug!("Already connected to {}", addr);
+            e.into_mut()
+        }
+        std::collections::hash_map::Entry::Vacant(e) => {
+            debug!("Connecting to {}", addr);
+            let Ok(stream) = TcpStream::connect(addr) else {
+                error!("Error connecting to remote {}", addr);
+                return None;
+            };
+            e.insert(stream)
+        }
+    };
+    stream.try_clone().ok()
+}
+
 pub fn mtcp_send_bundles(addr: SocketAddr, bundles: Vec<ByteBuffer>) -> TransferResult {
     // TODO: implement correct error handling
     // TODO: classic sending thread, tokio code would block and not complete large transmissions
@@ -226,24 +267,9 @@ pub fn mtcp_send_bundles(addr: SocketAddr, bundles: Vec<ByteBuffer>) -> Transfer
         }
     }
 
-    #[allow(clippy::map_entry)]
-    if !MTCP_CONNECTIONS.lock().contains_key(&addr) {
-        debug!("Connecting to {}", addr);
-        if let Ok(stream) = TcpStream::connect(addr) {
-            MTCP_CONNECTIONS.lock().insert(addr, stream);
-        } else {
-            error!("Error connecting to remote {}", addr);
-            return TransferResult::Failure;
-        }
-    } else {
-        debug!("Already connected to {}", addr);
+    let Some(mut s1) = pooled_stream(addr) else {
+        return TransferResult::Failure;
     };
-    let mut s1 = MTCP_CONNECTIONS
-        .lock()
-        .get(&addr)
-        .unwrap()
-        .try_clone()
-        .unwrap();
 
     if s1.write_all(&buf).is_err() {
         error!("Error writing data to {}", addr);
@@ -373,24 +399,9 @@ impl MtcpConvergenceLayer {
             }
         }
 
-        #[allow(clippy::map_entry)]
-        if !MTCP_CONNECTIONS.lock().contains_key(&addr) {
-            debug!("Connecting to {}", addr);
-            if let Ok(stream) = TcpStream::connect(addr) {
-                MTCP_CONNECTIONS.lock().insert(addr, stream);
-            } else {
-                error!("Error connecting to remote {}", addr);
-                return false;
-            }
-        } else {
-            debug!("Already connected to {}", addr);
+        let Some(mut s1) = pooled_stream(addr) else {
+            return false;
         };
-        let mut s1 = MTCP_CONNECTIONS
-            .lock()
-            .get(&addr)
-            .unwrap()
-            .try_clone()
-            .unwrap();
 
         if s1.write_all(&buf).is_err() {
             error!("Error writing data to {}", addr);
@@ -435,5 +446,30 @@ impl HelpStr for MtcpConvergenceLayer {
 impl std::fmt::Display for MtcpConvergenceLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "mtcp:{}:{}", self.local_addr, self.local_port)
+    }
+}
+
+#[cfg(test)]
+mod stale_connection_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    #[test]
+    fn a_connection_its_peer_closed_is_not_written_into() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // A first peer takes the connection, then goes (as one that restarts).
+        assert!(matches!(mtcp_send_bundles(addr, vec![b"one".to_vec()]), TransferResult::Successful));
+        let (first, _) = listener.accept().unwrap();
+        drop(first);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // The next bundles go on a new connection, to whoever listens now.
+        assert!(matches!(mtcp_send_bundles(addr, vec![b"two".to_vec()]), TransferResult::Successful));
+        let (mut second, _) = listener.accept().expect("a new connection");
+        second.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 16];
+        let n = second.read(&mut buf).unwrap();
+        assert!(n > 0 && buf[..n].ends_with(b"two"), "the bundle arrived: {:?}", &buf[..n]);
     }
 }
