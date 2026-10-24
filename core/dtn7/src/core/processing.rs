@@ -707,6 +707,17 @@ fn is_administrative_record_valid(bundle: &Bundle) -> bool {
     }
 }
 
+/// The status information positions a report asserts: every report carries
+/// all four items, only the ones that happened set (RFC 9171 6.1.1).
+fn asserted_positions(sr: &bp7::administrative_record::StatusReport) -> Vec<u32> {
+    sr.status_information
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.asserted)
+        .map(|(i, _)| i as u32)
+        .collect()
+}
+
 fn inspect_status_report(bid: &str, ar: AdministrativeRecord) {
     if let AdministrativeRecord::BundleStatusReport(bsr) = &ar {
         let sips = &bsr.status_information;
@@ -729,9 +740,9 @@ fn inspect_status_report(bid: &str, ar: AdministrativeRecord) {
             );
             return;
         }
-        for (i, sip) in sips.iter().enumerate() {
-            debug!("Parsing Status Report: {} #{} {:?} {:?}", bid, i, bsr, sip);
-            match i as u32 {
+        debug!("Parsing Status Report: {} {:?}", bid, bsr);
+        for i in asserted_positions(bsr) {
+            match i {
                 bp7::administrative_record::RECEIVED_BUNDLE => {}
                 bp7::administrative_record::FORWARDED_BUNDLE => {}
                 bp7::administrative_record::DELETED_BUNDLE => {}
@@ -901,5 +912,32 @@ mod tests {
             CanonicalData::BundleAge(age) => assert!(*age >= 1000 && *age < 3000),
             other => panic!("unexpected bundle age data: {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod status_report_tests {
+    use super::asserted_positions;
+    use bp7::administrative_record::*;
+    use bp7::EndpointID;
+
+    fn report(asserted: u32) -> StatusReport {
+        let item = |i| BundleStatusItem { asserted: i == asserted, time: 0, status_requested: false };
+        StatusReport {
+            status_information: (0..MAX_STATUS_INFORMATION_POS).map(item).collect(),
+            report_reason: NO_INFORMATION,
+            source_node: EndpointID::with_ipn(1, 0).unwrap(),
+            timestamp: bp7::CreationTimestamp::with_time_and_seq(1, 1),
+            frag_offset: 0,
+            frag_len: 0,
+        }
+    }
+
+    #[test]
+    fn only_what_a_report_asserts_is_taken() {
+        assert_eq!(asserted_positions(&report(RECEIVED_BUNDLE)), vec![RECEIVED_BUNDLE]);
+        assert_eq!(asserted_positions(&report(DELIVERED_BUNDLE)), vec![DELIVERED_BUNDLE]);
+        // A reception report used to be taken for a delivery (by its position).
+        assert!(!asserted_positions(&report(RECEIVED_BUNDLE)).contains(&DELIVERED_BUNDLE));
     }
 }
