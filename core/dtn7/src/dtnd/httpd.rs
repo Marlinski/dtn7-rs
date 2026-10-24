@@ -39,7 +39,7 @@ use bp7::EndpointID;
 use http::StatusCode;
 use humansize::format_size;
 use humansize::DECIMAL;
-use log::{trace, debug, info, warn};
+use log::{debug, info, trace, warn};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
@@ -506,6 +506,39 @@ async fn insert_post(body: bytes::Bytes) -> Result<String, (StatusCode, &'static
     }
 }
 
+/// The bundle `/send` makes of a request: its payload, a hop count block,
+/// and CRC-32 on every block.
+fn new_send_bundle(
+    src: EndpointID,
+    dst: EndpointID,
+    lifetime: std::time::Duration,
+    flags: BundleControlFlags,
+    data: Vec<u8>,
+) -> bp7::Bundle {
+    let pblock = bp7::primary::PrimaryBlockBuilder::default()
+        .bundle_control_flags(flags.bits())
+        .destination(dst)
+        .source(src.clone())
+        .report_to(src)
+        .creation_timestamp(CreationTimestamp::now())
+        .lifetime(lifetime)
+        .build()
+        .unwrap();
+    let mut bndl = bp7::bundle::BundleBuilder::default()
+        .primary(pblock)
+        .canonicals(vec![
+            bp7::canonical::new_payload_block(BlockControlFlags::empty(), data),
+            bp7::canonical::new_hop_count_block(2, BlockControlFlags::empty(), 32),
+        ])
+        .build()
+        .unwrap();
+    bndl.set_crc(bp7::crc::CRC_32);
+    // The type alone is not the checksum: without it, the bundle fails
+    // validation (validate_bundle) and is never transmitted.
+    bndl.calculate_crc();
+    bndl
+}
+
 //#[post("/send", guard = "fn_guard_localhost")]
 async fn send_post(
     query_params: extract::Query<HashMap<String, String>>,
@@ -542,30 +575,9 @@ async fn send_post(
         return Err((StatusCode::BAD_REQUEST, "Missing destination endpoint id!"));
     }
     let src = CONFIG.lock().host_eid.clone();
-
-    let pblock = bp7::primary::PrimaryBlockBuilder::default()
-        .bundle_control_flags(flags.bits())
-        .destination(dst)
-        .source(src.clone())
-        .report_to(src)
-        .creation_timestamp(CreationTimestamp::now())
-        .lifetime(lifetime)
-        .build()
-        .unwrap();
-
-    let bytes = body.to_vec();
-
-    let b_len = bytes.len();
+    let b_len = body.len();
     debug!("Received for sending: {:?}", b_len);
-    let mut bndl = bp7::bundle::BundleBuilder::default()
-        .primary(pblock)
-        .canonicals(vec![
-            bp7::canonical::new_payload_block(BlockControlFlags::empty(), bytes.to_vec()),
-            bp7::canonical::new_hop_count_block(2, BlockControlFlags::empty(), 32),
-        ])
-        .build()
-        .unwrap();
-    bndl.set_crc(bp7::crc::CRC_32);
+    let bndl = new_send_bundle(src, dst, lifetime, flags, body.to_vec());
 
     debug!(
         "Sending bundle {} to {}",
@@ -994,5 +1006,25 @@ mod tests {
     async fn send_rejects_invalid_destination() {
         let res = send_post(query(&[("dst", "not an eid")]), bytes::Bytes::new()).await;
         assert_eq!(res.unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::new_send_bundle;
+    use bp7::flags::BundleControlFlags;
+    use bp7::EndpointID;
+
+    #[test]
+    fn a_bundle_sent_over_http_passes_validation() {
+        let mut b = new_send_bundle(
+            EndpointID::with_ipn(1, 0).unwrap(),
+            EndpointID::with_ipn(2, 4).unwrap(),
+            std::time::Duration::from_secs(60),
+            BundleControlFlags::BUNDLE_MUST_NOT_FRAGMENTED,
+            b"hello".to_vec(),
+        );
+        assert!(b.crc_valid(), "every block's CRC computed");
+        crate::core::processing::validate_bundle(&b).expect("valid, so transmitted");
     }
 }
