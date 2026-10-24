@@ -25,7 +25,8 @@ if [ -n "$1" ]; then
 	
 	sed "s/^version = .* $msg$/version = \"${1#v}\" $msg/" -i core/dtn7/Cargo.toml
 	# update the version in examples/Cargo.toml for dtn7
-	sed "s/^dtn7 = .* $msg$/dtn7 = { path = \"..\/core\/dtn7\", default-features = false, version = \"${1#v}\"} $msg/" -i examples/Cargo.toml
+	# (the line is indented: keep its indentation)
+	sed "s/^\([[:space:]]*\)dtn7 = .* $msg$/\1dtn7 = { path = \"..\/core\/dtn7\", default-features = false, version = \"${1#v}\" } $msg/" -i examples/Cargo.toml
 
 	# update the changelog
 	git cliff --tag "$1" > CHANGELOG.md
